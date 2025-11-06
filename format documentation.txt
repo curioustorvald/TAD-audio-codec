@@ -1,0 +1,215 @@
+
+TSVM Advanced Audio (TAD) Format
+
+TAD is a perceptual audio codec for TSVM utilizing Discrete Wavelet Transform (DWT)
+with CDF 9/7 biorthogonal wavelets, providing efficient compression through M/S stereo
+decorrelation, frequency-dependent quantization, and raw int8 coefficient storage.
+Designed as an includable API for integration with TAV video encoder.
+
+When used inside of a video codec, only zstd-compressed payload is stored, chunk length
+is stored separately and quality index is shared with that of the video.
+
+# Suggested File Structure
+\x1F T S V M T A D
+[HEADER]
+[CHUNK 0]
+[CHUNK 1]
+[CHUNK 2]
+...
+
+## Header (16 bytes)
+    uint8  Magic[8]: "\x1F TSVM TAD"
+    uint8  Version: 1
+    uint8  Quality Level: 0-5 (0=lowest quality/smallest, 5=highest quality/largest)
+    uint8  Flags:
+            - bit 0: Zstd compression enabled (1=compressed, 0=uncompressed)
+            - bits 1-7: Reserved (must be 0)
+    uint32 Sample Rate: audio sample rate in Hz (always 32000 for TSVM)
+    uint8  Channels: number of audio channels (always 2 for stereo)
+    uint8  Reserved[2]: fill with zeros
+
+## Audio Properties
+- **Sample Rate**: 32000 Hz (TSVM audio hardware native format)
+- **Channels**: 2 (stereo)
+- **Input Format**: PCM32fLE (32-bit float little-endian PCM)
+- **Preprocessing**: 16 Hz highpass filter applied during extraction
+- **Internal Representation**: Float32 throughout encoding, PCM8 conversion only at decoder
+- **Chunk Size**: Variable (1024-32768+ samples per channel, any size ≥1024 supported)
+  - Default: 32768 samples (1.024 seconds at 32 kHz) for standalone files
+  - TAV integration: Uses exact GOP sample count (e.g., 32016 for 1 second at 32 kHz)
+  - Minimum: 1024 samples (32 ms at 32 kHz)
+  - DWT levels: Fixed at 9 levels for all chunk sizes
+- **Target Compression**: 2:1 against PCMu8 baseline
+- **Wavelet**: CDF 9/7 biorthogonal
+
+## Chunk Structure
+Each chunk encodes a variable number of stereo samples (minimum 1024, any size supported).
+Default is 32768 samples (65536 total samples, 1.024 seconds) for standalone files.
+TAV integration uses exact GOP sample counts (e.g., 32016 samples for 1 second at 32 kHz).
+
+    uint16 Sample Count: number of samples per channel (min 1024, any size ≥1024)
+    uint8  Max quantisation index: this number * 2 + 1 is the total steps of quantisation
+    uint32 Chunk Payload Size: size of following payload in bytes
+    *      Chunk Payload: encoded M/S stereo data (Zstd compressed if flag set)
+
+### Chunk Payload Structure (before optional Zstd compression)
+    *      Mid Channel Encoded Data (raw int8 values)
+    *      Side Channel Encoded Data (raw int8 values)
+
+## Encoding Pipeline
+
+### Step 1: Dynamic Range Compression (Gamma Compression)
+Input stereo PCM32fLE undergoes gamma compression for perceptual uniformity:
+
+    encode(x) = sign(x) * |x|^γ  where γ=0.707 (1/√2)
+
+This compresses dynamic range before quantization, improving perceptual quality.
+
+### Step 2: M/S Stereo Decorrelation
+Mid-Side transformation exploits stereo correlation:
+
+    Mid = (Left + Right) / 2
+    Side = (Left - Right) / 2
+
+This typically concentrates energy in the Mid channel while the Side channel
+contains mostly small values, improving compression efficiency.
+
+### Step 3: 9-Level CDF 9/7 DWT
+Each channel (Mid and Side) undergoes CDF 9/7 biorthogonal wavelet decomposition. The codec uses a fixed 9 decomposition levels for all chunk sizes:
+
+    DWT Levels = 9 (fixed)
+
+For 32768-sample chunks:
+    - After 9 levels: 64 LL coefficients
+    - Frequency subbands: LL + 9 H bands (L9 to L1)
+
+For 32016-sample chunks (TAV 1-second GOP):
+    - After 9 levels: 63 LL coefficients
+    - Supports non-power-of-2 sizes through proper length tracking (fixed 2025-10-30)
+
+Sideband boundaries are calculated dynamically:
+    first_band_size = chunk_size >> dwt_levels
+    sideband[0] = 0
+    sideband[1] = first_band_size
+    sideband[i+1] = sideband[i] + (first_band_size << (i-1))
+
+CDF 9/7 lifting coefficients:
+    α = -1.586134342
+    β = -0.052980118
+    γ = 0.882911076
+    δ = 0.443506852
+    K = 1.230174105
+
+### Step 4: Frequency-Dependent Quantization
+DWT coefficients are quantized using perceptually-tuned frequency-dependent weights.
+
+Final quantization step: base_weight * quality_scale
+
+#### Dead Zone Quantization
+High-frequency coefficients (Level 0: 8-16 KHz) use dead zone quantization
+where coefficients smaller than half the quantization step are zeroed:
+
+    if (abs(coefficient) < quantization_step / 2)
+        coefficient = 0
+
+This aggressively removes high-frequency noise while preserving important
+mid-frequency content (2-4 KHz critical for speech intelligibility).
+
+### Step 5: Raw Int8 Coefficient Storage
+Quantized coefficients are stored directly as signed int8 values (no significance map, better Zstd compression).
+Concatenated format: [Mid_channel_data][Side_channel_data]
+
+### Step 6: Coefficient-Domain Dithering (Encoder)
+Light triangular dithering (±0.5 quantization steps) added to coefficients before
+quantization to reduce banding artifacts.
+
+### Step 7: Zstd Compression
+The concatenated Mid+Side encoded data is compressed
+using Zstd level 7 for additional compression without significant CPU overhead.
+
+## Decoding Pipeline
+
+### Step 1: Chunk Extraction and Decompression
+Read chunk header (sample_count, max_index, payload_size).
+If compressed (default), decompress payload using Zstd.
+
+### Step 2: Coefficient Extraction
+Extract Mid and Side channel int8 data from concatenated payload:
+    - Mid channel: bytes [0..sample_count-1]
+    - Side channel: bytes [sample_count..2*sample_count-1]
+
+### Step 3: Dequantization with Lambda Decompanding
+Convert quantized int8 values back to float coefficients using:
+    1. Lambda decompanding (inverse of Laplacian CDF compression)
+    2. Multiply by frequency-dependent quantization steps
+    3. Apply coefficient-domain dithering (TPDF, ~-60 dBFS)
+
+### Step 4: 9-Level Inverse CDF 9/7 DWT
+Reconstruct Float32 audio from DWT coefficients using inverse CDF 9/7 transform.
+
+**Critical Implementation (Fixed 2025-10-30)**:
+The multi-level inverse DWT must use the EXACT sequence of lengths from forward
+transform, in reverse order. Using simple doubling (length *= 2) is INCORRECT
+for non-power-of-2 sizes.
+
+Correct approach:
+    1. Pre-calculate all forward transform lengths:
+       lengths[0] = chunk_size
+       lengths[i] = (lengths[i-1] + 1) / 2  for i=1..9
+    2. Apply inverse DWT in reverse order:
+       for level from 8 down to 0:
+           apply inverse_dwt(data, lengths[level])
+
+This ensures correct reconstruction for all chunk sizes including non-power-of-2
+values (e.g., 32016 samples for TAV 1-second GOPs).
+
+### Step 5: M/S to L/R Conversion
+Convert Mid/Side back to Left/Right stereo:
+
+    Left = Mid + Side
+    Right = Mid - Side
+
+### Step 6: Gamma Expansion
+Expand dynamic range (inverse of encoder's gamma compression):
+
+    decode(y) = sign(y) * |y|^(1/γ)  where γ=0.707, so 1/γ=√2≈1.414
+
+### Step 7: PCM32f to PCM8 Conversion with Noise-Shaped Dithering
+Convert Float32 samples to unsigned PCM8 (PCMu8) using second-order error-diffusion
+dithering with reduced amplitude (0.2× TPDF) to coordinate with coefficient-domain
+dithering.
+
+## Compression Performance
+- **Target Ratio**: 2:1 against PCMu8
+- **Achieved Ratio**: 2.51:1 against PCMu8 at quality level 3
+- **Quality**: Perceptually transparent at Q3+, preserves full 0-16 KHz bandwidth
+- **Sparsity**: 86.9% zeros in Mid channel, 97.8% in Side channel (typical)
+
+## Integration with TAV Encoder
+TAD is designed as an includable API for TAV video encoder integration.
+The encoder can be invoked programmatically to compress audio tracks:
+
+    #include "tad_encoder.h"
+
+    size_t encoded_size = tad_encode_from_file(
+        input_audio_path,
+        output_tad_path,
+        quality_level,
+        use_zstd,
+        verbose
+    );
+
+This allows TAV video files to embed TAD-compressed audio using packet type 0x24.
+
+## Audio Extraction Command
+TAD encoder uses two-pass FFmpeg extraction for optimal quality:
+
+    # Pass 1: Extract at original sample rate
+    ffmpeg -i input.mp4 -f f32le -ac 2 temp.pcm
+
+    # Pass 2: High-quality resample with SoXR and highpass filter
+    ffmpeg -f f32le -ar {original_rate} -ac 2 -i temp.pcm \
+           -ar 32000 -af "aresample=resampler=soxr:precision=28:cutoff=0.99,highpass=f=16" \
+           output.pcm
+
+This ensures resampling happens after extraction with optimal quality parameters.
