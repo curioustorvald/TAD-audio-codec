@@ -2,7 +2,9 @@
 # Makefile for TSVM Enhanced Video (TEV) encoder
 
 CC = gcc
+CXX = g++
 CFLAGS = -std=c99 -Wall -Wextra -O2 -D_GNU_SOURCE
+CXXFLAGS = -std=c++11 -Wall -Wextra -O2 -D_GNU_SOURCE
 
 # Zstd flags (use pkg-config if available, fallback for cross-platform compatibility)
 ZSTD_CFLAGS = $(shell pkg-config --cflags libzstd 2>/dev/null || echo "")
@@ -10,10 +12,10 @@ ZSTD_LIBS = $(shell pkg-config --libs libzstd 2>/dev/null || echo "-lzstd")
 LIBS = -lm $(ZSTD_LIBS)
 
 # Source files and targets
-TARGETS = encoder_tad decoder_tad
+TAD_TARGETS = encoder_tad decoder_tad
 
 # Build all encoders
-all: $(TARGETS)
+all: $(TAD_TARGETS)
 
 # Build TAD (Terrarum Advanced Audio) tools
 encoder_tad: encoder_tad_standalone.c encoder_tad.c encoder_tad.h
@@ -27,7 +29,7 @@ decoder_tad: decoder_tad.c
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o decoder_tad $< $(LIBS)
 
 # Build all TAD tools
-tad: $(TARGETS)
+tad: $(TAD_TARGETS)
 
 # Build with debug symbols
 debug: CFLAGS += -g -DDEBUG
@@ -35,10 +37,10 @@ debug: $(TARGETS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f $(TAD_TARGETS) *.o
 
 # Install (copy to PATH)
-install: $(TARGETS)
+install: $(TAD_TARGETS)
 	cp encoder_tad /usr/local/bin/
 	cp decoder_tad /usr/local/bin/
 
@@ -50,10 +52,10 @@ check-deps:
 
 # Help
 help:
-	@echo "TSVM Enhanced Video (TEV) and Audio (TAD) Encoders"
+	@echo "TSVM Advanced Video (TAV) and Audio (TAD) Encoders"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all          - Build TAV encoder and decoder (default)"
+	@echo "  all          - Build video encoders (default)"
 	@echo "  tad          - Build all TAD audio tools (encoder, decoder)"
 	@echo "  encoder_tad  - Build TAD audio encoder"
 	@echo "  decoder_tad  - Build TAD audio decoder"
@@ -64,7 +66,7 @@ help:
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make               # Build audio encoders"
+	@echo "  make               # Build video encoders"
 	@echo "  make tad           # Build all TAD audio tools"
 	@echo "  sudo make install  # Install all encoders"
 
